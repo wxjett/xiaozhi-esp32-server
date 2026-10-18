@@ -4,7 +4,10 @@ version: '3'
 services:
   # Server模块
   xiaozhi-esp32-server:
-    image: ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:server_latest
+    image: xiaozhi-server:local
+    build:
+      context: ../..
+      dockerfile: Dockerfile-server
     container_name: xiaozhi-esp32-server
     depends_on:
       - xiaozhi-esp32-server-db
@@ -13,10 +16,10 @@ services:
     networks:
       - default
     ports:
-      # ws服务端
-      - "8000:8000"
-      # http服务的端口，用于视觉分析接口
-      - "8003:8003"
+      # WebSocket 语音通道：ESP32 传送录音、接收语音回复及交互指令；宿主机 18000 -> 容器 8000
+      - "18000:8000"
+      # Core 辅助 HTTP 服务：提供图片视觉分析接口；宿主机 18003 -> 容器 8003
+      - "18003:8003"
     security_opt:
       - seccomp:unconfined
     environment:
@@ -29,7 +32,10 @@ services:
 
   # manager-api和manager-web模块
   xiaozhi-esp32-server-web:
-    image: ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:web_latest
+    image: xiaozhi-web:local
+    build:
+      context: ../..
+      dockerfile: Dockerfile-web
     container_name: xiaozhi-esp32-server-web
     restart: always
     networks:
@@ -40,8 +46,8 @@ services:
       xiaozhi-esp32-server-redis:
         condition: service_healthy
     ports:
-      # 智控台
-      - "8002:8002"
+      # 智控台网页、管理后台 API 及完整部署的 OTA 接口；宿主机 18002 -> 容器 8002
+      - "18002:8002"
     environment:
       - TZ=Asia/Shanghai
       - SPRING_DATASOURCE_DRUID_URL=jdbc:mysql://xiaozhi-esp32-server-db:3306/xiaozhi_esp32_server?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&nullCatalogMeansCurrent=true&connectTimeout=30000&socketTimeout=30000&autoReconnect=true&failOverReadOnly=false&maxReconnects=10
