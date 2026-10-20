@@ -10,11 +10,12 @@ from core.handle.abortHandle import handleAbortMessage
 from core.handle.intentHandler import handle_user_intent
 from core.utils.output_counter import check_device_output_limit
 from core.handle.sendAudioHandle import send_stt_message, SentenceType
+from core.utils.voice_trace import observe_audio, get_trace
 
 TAG = __name__
 
 
-async def handleAudioMessage(conn: "ConnectionHandler", pcm_frame):
+async def handleAudioMessage(conn: "ConnectionHandler", pcm_frame, received_at=None):
     # 当前片段是否有人说话
     have_voice = conn.vad.is_vad(conn, pcm_frame)
     # 如果设备刚刚被唤醒，短暂忽略VAD检测
@@ -24,6 +25,7 @@ async def handleAudioMessage(conn: "ConnectionHandler", pcm_frame):
         if not hasattr(conn, "vad_resume_task") or conn.vad_resume_task.done():
             conn.vad_resume_task = asyncio.create_task(resume_vad_detection(conn))
         return
+    observe_audio(conn, pcm_frame, have_voice, received_at)
     # 服务端AEC功能需要实时触发打断
     if conn.client_aec and have_voice:
         if conn.client_is_speaking and conn.client_listen_mode != "manual":
@@ -41,6 +43,7 @@ async def resume_vad_detection(conn: "ConnectionHandler"):
 
 
 async def startToChat(conn: "ConnectionHandler", text):
+    trace = get_trace(conn)
     # 检查输入是否是JSON格式（包含说话人信息）
     speaker_name = None
     actual_text = text
@@ -104,7 +107,9 @@ async def startToChat(conn: "ConnectionHandler", text):
     # 准备开始新会话
     conn.client_abort = False
 
-    conn.executor.submit(conn.chat, actual_text)
+    if trace:
+        trace.mark("chat_dispatch")
+    conn.executor.submit(conn.chat, actual_text, _voice_trace=trace)
 
 
 async def no_voice_close_connect(conn: "ConnectionHandler", have_voice):

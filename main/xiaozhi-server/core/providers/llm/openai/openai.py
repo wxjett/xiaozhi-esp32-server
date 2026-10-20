@@ -5,6 +5,7 @@ from config.logger import setup_logging
 from core.utils.util import check_model_key
 from core.providers.llm.base import LLMProviderBase
 from urllib.parse import urlparse
+from core.utils.voice_trace import current_trace
 
 TAG = __name__
 logger = setup_logging()
@@ -113,7 +114,16 @@ class LLMProvider(LLMProviderBase):
         # 禁用思考模式
         self._apply_thinking_disabled(request_params)
 
-        responses = self.client.chat.completions.create(**request_params)
+        trace = current_trace.get()
+        span = trace.new_span("llm") if trace else None
+        if trace:
+            trace.mark("llm_request", span=span, 模型=self.model_name, 接口主机=urlparse(self.base_url).hostname)
+        try:
+            responses = self.client.chat.completions.create(**request_params)
+        except Exception as exc:
+            if trace:
+                trace.error("LLM请求", exc, 状态码=getattr(exc, "status_code", None), 请求编号=getattr(exc, "request_id", None))
+            raise
 
         is_active = True
         try:            
@@ -124,6 +134,8 @@ class LLMProvider(LLMProviderBase):
                 except IndexError:
                     content = ""
                 if content:
+                    if trace:
+                        trace.mark("llm_first_response", span=span)
                     if "<think>" in content:
                         is_active = False
                         content = content.split("<think>")[0]
@@ -132,7 +144,13 @@ class LLMProvider(LLMProviderBase):
                         content = content.split("</think>")[-1]
                     if is_active:
                         yield content
+        except Exception as exc:
+            if trace:
+                trace.error("LLM流式接收", exc)
+            raise
         finally:
+            if trace:
+                trace.mark("llm_done", span=span)
             responses.close()
 
     def response_with_functions(self, session_id, dialogue, functions=None, **kwargs):
@@ -159,7 +177,16 @@ class LLMProvider(LLMProviderBase):
         # 禁用思考模式
         self._apply_thinking_disabled(request_params)
 
-        stream = self.client.chat.completions.create(**request_params)
+        trace = current_trace.get()
+        span = trace.new_span("llm") if trace else None
+        if trace:
+            trace.mark("llm_request", span=span, 模型=self.model_name, 接口主机=urlparse(self.base_url).hostname)
+        try:
+            stream = self.client.chat.completions.create(**request_params)
+        except Exception as exc:
+            if trace:
+                trace.error("LLM请求", exc, 状态码=getattr(exc, "status_code", None), 请求编号=getattr(exc, "request_id", None))
+            raise
 
         try:
             for chunk in stream:
@@ -167,6 +194,8 @@ class LLMProvider(LLMProviderBase):
                     delta = chunk.choices[0].delta
                     content = getattr(delta, "content", "")
                     tool_calls = getattr(delta, "tool_calls", None)
+                    if trace and (content or tool_calls):
+                        trace.mark("llm_first_response", span=span)
                     yield content, tool_calls
                 elif isinstance(getattr(chunk, "usage", None), CompletionUsage):
                     usage_info = getattr(chunk, "usage", None)
@@ -175,5 +204,11 @@ class LLMProvider(LLMProviderBase):
                         f"输出 {getattr(usage_info, 'completion_tokens', '未知')}，"
                         f"共计 {getattr(usage_info, 'total_tokens', '未知')}"
                     )
+        except Exception as exc:
+            if trace:
+                trace.error("LLM流式接收", exc)
+            raise
         finally:
+            if trace:
+                trace.mark("llm_done", span=span)
             stream.close()

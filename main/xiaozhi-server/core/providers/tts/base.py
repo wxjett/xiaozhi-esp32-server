@@ -26,6 +26,8 @@ from core.providers.tts.dto.dto import (
     InterfaceType,
 )
 
+from core.utils.voice_trace import current_trace, current_segment, traced_tts_segment
+
 TAG = __name__
 logger = setup_logging()
 
@@ -116,12 +118,16 @@ class TTSProviderBase(ABC):
         )
 
     def handle_opus(self, opus_data: bytes):
+        trace = current_trace.get()
+        if trace:
+            trace.mark("audio_queued_first")
         logger.bind(tag=TAG).debug(f"推送数据到队列里面帧数～～ {len(opus_data)}")
         self.tts_audio_queue.put((SentenceType.MIDDLE, opus_data, None, getattr(self, 'current_sentence_id', None)))
 
     def handle_audio_file(self, file_audio: bytes, text):
         self.before_stop_play_files.append((file_audio, text))
 
+    @traced_tts_segment
     def to_tts_stream(self, text, opus_handler: Callable[[bytes], None] = None) -> None:
         # 保留原始文本用于显示/上报
         original_text = text
@@ -136,6 +142,9 @@ class TTSProviderBase(ABC):
                 try:
                     audio_bytes = asyncio.run(self.text_to_speak(text, None))
                     if audio_bytes:
+                        trace = current_trace.get()
+                        if trace:
+                            trace.mark("tts_conversion", span=current_segment.get())
                         # 使用原始文本用于显示/上报
                         self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, getattr(self, 'current_sentence_id', None)))
                         audio_bytes_to_data_stream(
@@ -150,6 +159,9 @@ class TTSProviderBase(ABC):
                     else:
                         max_repeat_time -= 1
                 except Exception as e:
+                    trace = current_trace.get()
+                    if trace:
+                        trace.error("TTS片段重试", e, 片段=current_segment.get(), 重试序号=5 - max_repeat_time + 1)
                     logger.bind(tag=TAG).warning(
                         f"语音生成失败{5 - max_repeat_time + 1}次: {original_text}，错误: {e}"
                     )
@@ -186,6 +198,9 @@ class TTSProviderBase(ABC):
                     logger.bind(tag=TAG).error(
                         f"语音生成失败: {original_text}，请检查网络或服务是否正常"
                     )
+                trace = current_trace.get()
+                if trace:
+                    trace.mark("tts_conversion", span=current_segment.get())
                 self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, getattr(self, 'current_sentence_id', None)))
                 self._process_audio_file_stream(tmp_file, callback=opus_handler)
             except Exception as e:
@@ -369,8 +384,11 @@ class TTSProviderBase(ABC):
     # 流式处理方式请在子类中重写
     def tts_text_priority_thread(self):
         while not self.conn.stop_event.is_set():
+            trace_token = None
             try:
                 message = self.tts_text_queue.get(timeout=1)
+                trace = getattr(message, "voice_trace", None)
+                trace_token = current_trace.set(trace)
                 if self.conn.client_abort:
                     logger.bind(tag=TAG).info("收到打断信息，终止TTS文本处理线程")
                     continue
@@ -385,6 +403,8 @@ class TTSProviderBase(ABC):
                     self.is_first_sentence = True
                     self.tts_audio_first_sentence = True
                 elif ContentType.TEXT == message.content_type:
+                    if trace and message.content_detail:
+                        trace.mark("tts_dequeued")
                     self.tts_text_buff.append(message.content_detail)
                     segment_text = self._get_segment_text()
                     if segment_text:
@@ -409,6 +429,10 @@ class TTSProviderBase(ABC):
                     f"处理TTS文本失败: {str(e)}, 类型: {type(e).__name__}, 堆栈: {traceback.format_exc()}"
                 )
                 continue
+
+            finally:
+                if trace_token is not None:
+                    current_trace.reset(trace_token)
 
     def _audio_play_priority_thread(self):
         # 需要上报的文本和音频列表

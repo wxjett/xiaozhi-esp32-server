@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import re
 from loguru import logger
 from config.config_loader import load_config
 from config.settings import check_config_file
@@ -8,6 +9,19 @@ from core.utils.cache.manager import cache_manager, CacheType
 
 SERVER_VERSION = "0.9.7"
 _logger_initialized = False
+
+_SECRET_FIELDS = re.compile(
+    r'''(?i)(["'](?:authorization|x-nls-token|api_key|appkey|token|access_token|personal_access_token|access_key_id|access_key_secret|secret|secret_key|password)["']\s*:\s*)(["'])(.*?)(\2)'''
+)
+
+
+def redact_log_message(message):
+    message = _SECRET_FIELDS.sub(lambda m: m[1] + m[2] + "***" + m[2], message)
+    message = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer ***", message)
+    return re.sub(
+        r"(?i)([?&](?:token|api_key|appkey|secret|password)=)[^&\s\"']+",
+        r"\1***", message,
+    )
 
 
 def get_module_abbreviation(module_name, module_dict):
@@ -37,6 +51,7 @@ def build_module_string(selected_module):
 
 
 def formatter(record):
+    record["message"] = redact_log_message(record["message"])
     """为没有 tag 的日志添加默认值，并处理动态模块字符串"""
     record["extra"].setdefault("tag", record["name"])
     # 如果没有设置 selected_module，使用默认值
@@ -77,6 +92,10 @@ def setup_logging(config=None):
         )
         log_format = log_format.replace("{version}", SERVER_VERSION)
         log_format_file = log_format_file.replace("{version}", SERVER_VERSION)
+        # 兼容智控台保存的旧模板，统一补齐毫秒。
+        for template in ("YYMMDD HH:mm:ss", "YYYY-MM-DD HH:mm:ss"):
+            log_format = log_format.replace("{time:" + template + "}", "{time:" + template + ".SSS}")
+            log_format_file = log_format_file.replace("{time:" + template + "}", "{time:" + template + ".SSS}")
 
         log_level = log_config.get("log_level", "INFO")
         log_dir = log_config.get("log_dir", "tmp")
@@ -90,7 +109,7 @@ def setup_logging(config=None):
         logger.remove()
 
         # 输出到控制台
-        logger.add(sys.stdout, format=log_format, level=log_level, filter=formatter)
+        logger.add(sys.stdout, format=log_format, level=log_level, filter=formatter, diagnose=False)
 
         # 输出到文件 - 统一目录，按大小轮转
         # 日志文件完整路径
@@ -108,7 +127,7 @@ def setup_logging(config=None):
             encoding="utf-8",
             enqueue=True,  # 异步安全
             backtrace=True,
-            diagnose=True,
+            diagnose=False,
         )
         _logger_initialized = True  # 标记为已初始化
 

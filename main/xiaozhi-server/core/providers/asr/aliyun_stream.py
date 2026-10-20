@@ -13,6 +13,7 @@ from config.logger import setup_logging
 from core.providers.asr.base import ASRProviderBase
 from core.providers.asr.dto.dto import InterfaceType
 from typing import TYPE_CHECKING
+from core.utils.voice_trace import get_trace
 
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
@@ -140,6 +141,10 @@ class ASRProvider(ASRProviderBase):
                 await self._start_recognition(conn)
             except Exception as e:
                 logger.bind(tag=TAG).error(f"开始识别失败: {str(e)}")
+                trace = get_trace(conn)
+                if trace:
+                    trace.error("ASR建连", e)
+                    trace.finish("ASR建连失败")
                 await self._cleanup()
                 return
 
@@ -148,6 +153,9 @@ class ASRProvider(ASRProviderBase):
                 await self._send_pending_audio(conn)
             except Exception as e:
                 logger.bind(tag=TAG).warning(f"发送音频失败: {str(e)}")
+                trace = get_trace(conn)
+                if trace:
+                    trace.error("ASR音频发送", e)
                 await self._cleanup()
 
     async def _send_pending_audio(self, conn):
@@ -160,6 +168,9 @@ class ASRProvider(ASRProviderBase):
                 and self._sent_audio_index < len(conn.asr_audio)
             ):
                 await self.asr_ws.send(conn.asr_audio[self._sent_audio_index])
+                trace = get_trace(conn)
+                if trace:
+                    trace.mark("asr_audio_first")
                 self._sent_audio_index += 1
 
     async def _start_recognition(self, conn: "ConnectionHandler"):
@@ -171,6 +182,9 @@ class ASRProvider(ASRProviderBase):
         self._stop_requested = False
         
         # 建立连接
+        trace = get_trace(conn)
+        if trace:
+            trace.mark("asr_connect", 服务商="aliyun_stream")
         headers = {"X-NLS-Token": self.token}
         self.asr_ws = await websockets.connect(
             self.ws_url,
@@ -182,6 +196,8 @@ class ASRProvider(ASRProviderBase):
         )
 
         self.task_id = uuid.uuid4().hex
+        if trace:
+            trace.mark("asr_connected", 请求编号=self.task_id)
 
         logger.bind(tag=TAG).debug(f"WebSocket连接建立成功, task_id: {self.task_id}")
 
@@ -208,11 +224,14 @@ class ASRProvider(ASRProviderBase):
                 "enable_voice_detection": False,
             }
         }
+        if trace:
+            trace.mark("asr_start")
         await self.asr_ws.send(json.dumps(start_request, ensure_ascii=False))
         logger.bind(tag=TAG).debug("已发送开始请求，等待服务器准备...")
 
     async def _forward_results(self, conn: "ConnectionHandler"):
         """转发识别结果"""
+        trace = get_trace(conn)
         try:
             while not conn.stop_event.is_set():
                 # 获取当前连接的音频数据
@@ -227,6 +246,8 @@ class ASRProvider(ASRProviderBase):
                     status = header.get("status", 0)
 
                     if status != 20000000:
+                        if trace:
+                            trace.error("ASR服务返回", 状态码=status, 请求编号=header.get("task_id"))
                         if status == 40010004:
                             logger.bind(tag=TAG).warning(f"请在服务端响应完成后再关闭链接，状态码: {status}")
                             break
@@ -242,6 +263,8 @@ class ASRProvider(ASRProviderBase):
 
                     # 收到TranscriptionStarted表示服务器准备好接收音频数据
                     if message_name == "TranscriptionStarted":
+                        if trace:
+                            trace.mark("asr_ready", 缓存帧数=len(conn.asr_audio))
                         self.server_ready = True
                         logger.bind(tag=TAG).debug("服务器已准备，开始发送缓存音频...")
 
@@ -254,6 +277,8 @@ class ASRProvider(ASRProviderBase):
                         # 句子结束（每个句子都会触发）
                         text = payload.get("result", "")
                         if text:
+                            if trace:
+                                trace.mark("asr_final", 字符数=len(text), 请求编号=header.get("task_id"))
                             logger.bind(tag=TAG).info(f"识别到文本: {text}")
 
                             # 手动模式下累积识别结果
@@ -282,12 +307,16 @@ class ASRProvider(ASRProviderBase):
                     self.is_processing = False
                     break
                 except Exception as e:
+                    if trace:
+                        trace.error("ASR结果接收", e)
                     logger.bind(tag=TAG).error(f"处理结果失败: {str(e)}")
                     break
 
         except Exception as e:
             logger.bind(tag=TAG).error(f"结果转发失败: {str(e)}")
         finally:
+            if trace and ("asr_final", None) not in trace.events:
+                trace.finish("ASR未返回文字")
             # 清理连接的音频缓存
             await self._cleanup()
             conn.reset_audio_states()

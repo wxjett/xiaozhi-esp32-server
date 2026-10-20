@@ -11,6 +11,7 @@ from datetime import datetime
 from config.logger import setup_logging
 from core.providers.tts.base import TTSProviderBase
 from core.utils.tts import convert_percentage_to_range
+from core.utils.voice_trace import current_trace, current_segment
 
 
 TAG = __name__
@@ -171,6 +172,8 @@ class TTSProvider(TTSProviderBase):
         return time.time() > self.expire_time
 
     async def text_to_speak(self, text, output_file):
+        trace = current_trace.get()
+        request_span = trace.new_span("tts_http") if trace else None
         if self._is_token_expired():
             logger.warning("Token已过期，正在自动刷新...")
             self._refresh_token()
@@ -188,6 +191,8 @@ class TTSProvider(TTSProviderBase):
 
         # print(self.api_url, json.dumps(request_json, ensure_ascii=False))
         try:
+            if trace:
+                trace.mark("tts_request", span=request_span, 片段=current_segment.get(), 服务商="aliyun", 字符数=len(text))
             resp = requests.post(
                 self.api_url,
                 json.dumps(request_json),
@@ -195,7 +200,12 @@ class TTSProvider(TTSProviderBase):
                 timeout=self.tts_timeout,
             )
             if resp.status_code == 401:  # Token过期特殊处理
+                if trace:
+                    trace.error("TTS鉴权重试", 状态码=401, 请求编号=resp.headers.get("X-Request-Id"))
                 self._refresh_token()
+                if trace:
+                    request_span = trace.new_span("tts_http")
+                    trace.mark("tts_request", span=request_span, 片段=current_segment.get(), 服务商="aliyun", 重试原因="HTTP401")
                 resp = requests.post(
                     self.api_url,
                     json.dumps(request_json),
@@ -204,6 +214,8 @@ class TTSProvider(TTSProviderBase):
                 )
             # 检查返回请求数据的mime类型是否是audio/***，是则保存到指定路径下；返回的是binary格式的
             if resp.headers["Content-Type"].startswith("audio/"):
+                if trace:
+                    trace.mark("tts_audio", span=request_span, 片段=current_segment.get(), 字节数=len(resp.content), 状态码=resp.status_code)
                 if output_file:
                     with open(output_file, "wb") as f:
                         f.write(resp.content)
@@ -211,8 +223,16 @@ class TTSProvider(TTSProviderBase):
                 else:
                     return resp.content
             else:
+                if trace:
+                    try:
+                        error = resp.json()
+                    except ValueError:
+                        error = {}
+                    trace.error("TTS服务返回", 状态码=resp.status_code, 服务商错误码=error.get("status"), 请求编号=error.get("request_id"))
                 raise Exception(
                     f"{__name__} status_code: {resp.status_code} response: {resp.content}"
                 )
         except Exception as e:
+            if trace:
+                trace.error("TTS请求或音频接收", e)
             raise Exception(f"{__name__} error: {e}")

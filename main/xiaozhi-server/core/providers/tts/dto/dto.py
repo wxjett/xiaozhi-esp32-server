@@ -1,5 +1,6 @@
 from enum import Enum
 from typing import Union, Optional
+from core.utils.voice_trace import current_trace
 
 
 class SentenceType(Enum):
@@ -41,3 +42,6 @@ class TTSMessageDTO:
         self.content_type = content_type
         self.content_detail = content_detail
         self.content_file = content_file
+        self.voice_trace = current_trace.get()
+        if self.voice_trace and content_type == ContentType.TEXT and content_detail and content_detail.strip():
+            self.voice_trace.mark("reply_text", 字符数=len(content_detail))

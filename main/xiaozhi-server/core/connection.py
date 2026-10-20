@@ -45,6 +45,7 @@ from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import textUtils
+from core.utils.voice_trace import traced_chat, bind_sentence, current_trace
 
 
 TAG = __name__
@@ -158,6 +159,9 @@ class ConnectionHandler:
         # 所以涉及到ASR的变量，需要在这里定义，属于connection的私有变量
         self.asr_audio = []  # 存储PCM帧列表，供VAD和ASR共享
         self.asr_audio_queue = queue.Queue()
+        self.voice_audio_history = deque(maxlen=10)
+        self.input_voice_trace = None
+        self.voice_traces = {}
         self.current_speaker = None  # 存储当前说话人
         self.introduced_speakers = set()  # 已"首次引入"的说话人，控制只在首轮带名字
         self.system_introduced_speakers = set()  # 已在 system 注入过身份的说话人，控制 system 身份只首轮出现
@@ -215,7 +219,7 @@ class ConnectionHandler:
             else:
                 self.client_ip = ws.remote_address[0]
             self.logger.bind(tag=TAG).info(
-                f"{self.client_ip} conn - Headers: {self.headers}"
+                f"{self.client_ip} conn - Headers: {filter_sensitive_info(self.headers)}"
             )
 
             self.device_id = self.headers.get("device-id", None)
@@ -347,6 +351,7 @@ class ConnectionHandler:
 
     async def _route_message(self, message):
         """消息路由"""
+        received_at = time.monotonic()
         # 检查是否已经获取到真实的绑定状态
         if not self.bind_completed_event.is_set():
             # 还没有获取到真实状态，等待直到获取到真实状态或超时
@@ -380,7 +385,7 @@ class ConnectionHandler:
             # 入口处直接解码PCM，避免VAD和ASR重复解码
             pcm_frame = self._decode_opus_packet(message)
             if pcm_frame:
-                self.asr_audio_queue.put(pcm_frame)
+                self.asr_audio_queue.put((pcm_frame, received_at))
 
     async def _process_mqtt_audio_message(self, message):
         """
@@ -392,6 +397,7 @@ class ConnectionHandler:
         Returns:
             bool: 是否成功处理了消息
         """
+        received_at = time.monotonic()
         try:
             # 解析timestamp
             timestamp = int.from_bytes(message[8:12], "big")
@@ -406,7 +412,7 @@ class ConnectionHandler:
             if timestamp > 0 and self.client_aec:
                 pcm_frame = self._apply_aec(timestamp, pcm_frame)
 
-            self.asr_audio_queue.put(pcm_frame)
+            self.asr_audio_queue.put((pcm_frame, received_at))
             return True
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"解析WebSocket音频包失败: {e}")
@@ -1052,6 +1058,7 @@ class ConnectionHandler:
         # 更新系统prompt至上下文
         self.dialogue.update_system_message(self.prompt)
 
+    @traced_chat
     def chat(self, query, depth=0):
         # 保存当前任务的sentence_id到局部变量，避免被新任务覆盖
         current_sentence_id = None
@@ -1063,6 +1070,7 @@ class ConnectionHandler:
         if depth == 0:
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
+            bind_sentence(self, current_sentence_id)
             self.dialogue.put(Message(role="user", content=query))
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
@@ -1144,6 +1152,11 @@ class ConnectionHandler:
                 )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
+            trace = current_trace.get()
+            if trace:
+                trace.error("LLM对话初始化", e)
+                trace.finish("LLM请求失败")
+                self.voice_traces.pop(current_sentence_id, None)
             return None
 
         # 处理流式响应
@@ -1543,6 +1556,12 @@ class ConnectionHandler:
     async def close(self, ws=None):
         """资源清理方法"""
         try:
+            traces = list(self.voice_traces.values())
+            if self.input_voice_trace:
+                traces.append(self.input_voice_trace)
+            for trace in traces:
+                trace.finish("连接关闭")
+            self.voice_traces.clear()
             # 清理 VAD 连接资源
             if (
                     hasattr(self, "vad")
@@ -1703,6 +1722,8 @@ class ConnectionHandler:
 
         # Clear ASR buffers
         self.asr_audio.clear()
+        self.voice_audio_history.clear()
+        self.input_voice_trace = None
 
         self.logger.bind(tag=TAG).debug("All audio states reset.")
 

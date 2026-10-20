@@ -1,4 +1,5 @@
 import json
+from core.utils.voice_trace import get_trace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -7,6 +8,10 @@ TAG = __name__
 
 
 async def handleAbortMessage(conn: "ConnectionHandler"):
+    trace = get_trace(conn, conn.sentence_id)
+    if trace:
+        trace.finish("打断")
+        conn.voice_traces.pop(conn.sentence_id, None)
     conn.logger.bind(tag=TAG).info("Abort message received")
     # 设置成打断状态，会自动打断llm、tts任务
     conn.close_after_chat = False

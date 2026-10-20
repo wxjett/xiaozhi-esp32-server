@@ -10,6 +10,7 @@ from core.utils import textUtils
 from core.utils.util import audio_to_data
 from core.providers.tts.dto.dto import SentenceType
 from core.utils.audioRateController import AudioRateController
+from core.utils.voice_trace import get_trace
 
 TAG = __name__
 # 音频帧时长（毫秒）
@@ -198,6 +199,7 @@ def _get_or_create_rate_controller(
             "packet_count": 0,
             "sequence": 0,
             "sentence_id": conn.sentence_id,
+            "voice_trace": get_trace(conn, conn.sentence_id),
         }
 
         # 启动后台发送循环
@@ -277,6 +279,9 @@ async def _do_send_audio(conn: "ConnectionHandler", opus_packet, flow_control):
         await conn.websocket.send(opus_packet)
 
     # 更新流控状态
+    trace = flow_control.get("voice_trace")
+    if trace:
+        trace.audio_sent(len(opus_packet))
     flow_control["packet_count"] = packet_index + 1
     flow_control["sequence"] = sequence + 1
 
@@ -315,6 +320,11 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
 
     # 发送消息到客户端
     await conn.websocket.send(json.dumps(message))
+    if state == "stop":
+        trace = get_trace(conn, current_sentence_id)
+        if trace:
+            trace.finish("音频下发完成" if trace.output_frames else "结束但未下发音频")
+            conn.voice_traces.pop(current_sentence_id, None)
 
 
 async def send_stt_message(conn: "ConnectionHandler", text):

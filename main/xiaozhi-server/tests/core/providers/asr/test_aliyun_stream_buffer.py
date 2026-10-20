@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import websockets
+from core.utils.voice_trace import VoiceTrace
 
 
 # 可直接运行此文件，避免测试日志初始化读取生产配置。
@@ -178,6 +179,23 @@ class AliyunStreamBufferTests(unittest.IsolatedAsyncioTestCase):
         await self.feed([b"reconnected"])
         await self.wait_until(lambda: bool(self.socket.audio))
         self.assertEqual(self.socket.audio, [b"reconnected"])
+
+    async def test_trace_records_real_asr_callbacks(self):
+        trace = VoiceTrace(Mock())
+        self.conn.input_voice_trace = trace
+        self.provider.handle_voice_stop = AsyncMock()
+        await self.feed([b"recording"])
+        task = self.provider.forward_task
+        self.socket.ready()
+        await self.wait_until(lambda: bool(self.socket.audio))
+        self.socket.responses.put_nowait(json.dumps({
+            "header": {"name": "SentenceEnd", "status": 20000000},
+            "payload": {"result": "测试语音"},
+        }))
+        await asyncio.wait_for(task, 1)
+        for event in ("asr_connect", "asr_connected", "asr_start", "asr_ready", "asr_audio_first", "asr_final"):
+            self.assertIn((event, None), trace.events)
+        self.provider.handle_voice_stop.assert_awaited_once()
 
 
 if __name__ == "__main__":
